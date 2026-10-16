@@ -3,6 +3,19 @@ import { parseRelative } from './relative.js'
 import { toSeconds } from 'iso8601-duration'
 
 /**
+ * Escapes a value as a SQL literal. sqlstring escapes quotes with backslashes, which only MySQL honors;
+ * Postgres (standard_conforming_strings) and SQLite need quotes doubled instead.
+ * @param {any} value
+ * @param {string} dialect
+ */
+function escape (value, dialect) {
+  if (dialect === 'mysql') return sqlString.escape(value)
+  if (Array.isArray(value)) return value.map(v => escape(v, dialect)).join(', ')
+  if (typeof value === 'string') return "'" + value.replace(/'/g, "''") + "'"
+  return sqlString.escape(value)
+}
+
+/**
  * Sanitizes SQL strings by replacing $1, $2, $3, etc with the corresponding parameter
  *
  * @param {string} key
@@ -29,12 +42,14 @@ function replace (key, params, dialect) {
   if (params[key] instanceof Date) {
     let dateStr = params[key].toISOString()
     if (dialect === 'sqlite') dateStr = dateStr.replace('T', ' ').replace('Z', '')
-    if (dialect === 'mysql') dateStr = dateStr.replace('T', ' ').replace('Z', '+00:00')
-    return sqlString.escape(dateStr)
+    // MySQL stores naive UTC; its queries compare against UTC_TIMESTAMP() rather than the session time zone.
+    if (dialect === 'mysql') dateStr = dateStr.replace('T', ' ').replace('Z', '')
+    return escape(dateStr, dialect)
   }
 
   if (params[key] && typeof params[key] === 'object' && !Array.isArray(params[key])) {
     if (modifier !== 'json') throw new Error('Invalid object, use :json to stringify it.')
+    if (dialect !== 'mysql') return escape(JSON.stringify(params[key]), dialect)
     return sqlString.escape(JSON.stringify(params[key])).replace(/\\"/g, '"')
   }
 
@@ -46,7 +61,7 @@ function replace (key, params, dialect) {
     return 'INTERVAL ' + seconds + ' SECOND'
   }
 
-  return sqlString.escape(params[key])
+  return escape(params[key], dialect)
 }
 
 /**

@@ -15,4 +15,4 @@ import { deleteSingle } from './postgres.js';
 import { deleteQueue } from './postgres.js';
 import { flush } from './postgres.js';
 import { insert } from './postgres.js';
-export { deleteSingle, deleteQueue, flush, insert };
+export { deleteSingle, deleteMany, deleteQueue, flush, insert };
