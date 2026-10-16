@@ -240,7 +240,9 @@ Swag.onError(async (err, job) => {
 
 ## Scheduling inside a transaction
 
-`withQuery` returns a view of the scheduler that sends `schedule`, `scheduleMany`, `remove` and `removeMany` through a query function you pass, so jobs commit or roll back with the rest of your writes. The view never creates the table, so call `await swag.init()` once at boot. Don't run workers from it.
+`withQuery` returns a view of the scheduler that sends `schedule`, `scheduleMany`, `remove` and `removeMany` through a query function you pass, so jobs commit or roll back with the rest of your writes. The view never creates the table, so call `await swag.init()` once at boot; otherwise the first scheduler call made while your transaction is open can block on that transaction's own locks. Views can't run workers (`on()` throws).
+
+The view assumes the function is bound to an open transaction. If it isn't, pass `{ inTransaction: false }` so `scheduleMany` wraps its own. On SQLite, pass a function built on `db.exec` (or give one as `{ none }`), since `prepare().all()` only accepts a single statement that returns rows.
 
 ```js
 await swag.init()
@@ -251,4 +253,4 @@ await db.tx(async t => {
 })
 ```
 
-`removeMany(queue, ids)` deletes several jobs by id in one statement.
+`removeMany(queue, ids)` deletes several jobs by id in one statement. `ids` can be any iterable of strings or numbers.

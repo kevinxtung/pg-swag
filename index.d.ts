@@ -31,6 +31,14 @@ export class Swag {
         table?: string;
     });
     initialized: boolean;
+    /** @type {Promise<void> | null} */
+    initializing: Promise<void> | null;
+    inTransaction: boolean;
+    isView: boolean;
+    /** @type {Set<string>} */
+    lockedJobs: Set<string>;
+    /** @type {Set<string>} */
+    activeJobs: Set<string>;
     /** @type {keyof typeof connections} */
     dialect: keyof typeof connections;
     queries: typeof sqlite | typeof postgres | typeof mysql;
@@ -48,6 +56,13 @@ export class Swag {
         schema: string;
         table: string;
     };
+    /**
+     * Creates the jobs table and indexes if they do not exist. Runs automatically on first use,
+     * but call it at boot if you plan to schedule through `withQuery`, which never initializes.
+     * Concurrent calls share one attempt, and a failed attempt is retried on the next call.
+     * @returns {Promise<void>}
+     */
+    init(): Promise<void>;
     /**
      * Schedules a job to run either at a specific time or on a repeating interval.
      *
@@ -157,11 +172,41 @@ export class Swag {
         data: any;
     }[], preserveRunAt?: boolean): Promise<void>;
     /**
+     * Returns a view of this scheduler that runs `schedule`, `scheduleMany` and `remove*` through
+     * the given query function, typically one bound to an open transaction so jobs commit or roll
+     * back with the rest of your writes. The view never initializes the table (call `init()` at boot,
+     * or the first scheduler call inside your transaction may wait on its own locks) and can't run workers.
+     *
+     * @param {(str: string) => Promise<any>} query
+     * @param {{ none?: (str: string) => Promise<any>, inTransaction?: boolean }} [options]
+     * `none` runs statements that return no rows (on SQLite, pass one built on `db.exec`).
+     * Set `inTransaction: false` if `query` is not bound to a transaction, so `scheduleMany` wraps its own.
+     * @returns {Swag}
+     *
+     * @example
+     * ```
+     * await db.tx(async t => {
+     *   await t.none('update orders set status = $1 where id = $2', ['paid', orderId])
+     *   await swag.withQuery(str => t.any(str)).schedule('receipt', orderId, new Date(), { orderId })
+     * })
+     * ```
+     */
+    withQuery(query: (str: string) => Promise<any>, { none, inTransaction }?: {
+        none?: (str: string) => Promise<any>;
+        inTransaction?: boolean;
+    }): Swag;
+    /**
       * Removes a job / schedule from the scheduler.
       * @param {string} queue - The name of the queue to remove the job from.
-      * @param {string} [id] - The unique identifier for the job.
+      * @param {string | number} [id] - The unique identifier for the job.
       */
-    remove(queue: string, id?: string): Promise<any>;
+    remove(queue: string, id?: string | number): Promise<any>;
+    /**
+      * Removes several jobs from a queue in one statement.
+      * @param {string} queue - The name of the queue to remove the jobs from.
+      * @param {Iterable<string | number>} ids - The unique identifiers of the jobs.
+      */
+    removeMany(queue: string, ids: Iterable<string | number>): Promise<any>;
     /**
      * Creates a handler for a given queue that receives the job information.
      * @param {string} queue The type of job to listen for.
@@ -231,7 +276,6 @@ export class Swag {
      * @param {string} queue
      */
     stop(queue: string): Promise<void>;
-    #private;
 }
 declare namespace connections {
     export { postgres };

@@ -5,18 +5,18 @@ export const fetch = `
 select *, attempts + 1 as attempts
 from $1:name
 where queue = $3
-and locked_until <= now()
+and locked_until <= UTC_TIMESTAMP()
 limit $4
 for update skip locked`
 
 export const lock = `
 update $1:name
-set locked_until = ADDDATE(now(), $5:mysqlInterval), locked_by = $2, attempts = attempts + 1
+set locked_until = ADDDATE(UTC_TIMESTAMP(), $5:mysqlInterval), locked_by = $2, attempts = attempts + 1
 where id in ($6:csv)
-and queue = $3 and locked_until <= now();
+and queue = $3 and locked_until <= UTC_TIMESTAMP();
 `
 
-export const heartbeat = 'update $1:name set locked_until = ADDDATE(now(), $2:mysqlInterval) where id in ($3:csv) and queue = $4'
+export const heartbeat = 'update $1:name set locked_until = ADDDATE(UTC_TIMESTAMP(), $2:mysqlInterval) where id in ($3:csv) and queue = $4'
 
 export const init = `
 begin;
@@ -27,9 +27,9 @@ create unique index idx_jobs_queue_id on $1:name (queue(32), id(20));
 commit;
 `
 
-// Todo: Optimize the time_zone setting; we shouldn't have to set it every time
+// Dates are stored as naive UTC and compared against UTC_TIMESTAMP(), so this stays a single statement
+// that doesn't depend on (or change) the session time zone.
 export const insert = `
-SET time_zone = '+00:00';
 insert into $1:name (queue, id, run_at, data, expression, locked_until)
 values ($2, $3, $4, $5:json, $6, $4)
 on DUPLICATE KEY update data = $5:json, expression = $6

@@ -114,15 +114,41 @@ async function processBatch (handlerId, queue, handler, completed, options) {
  * @param {string} queue
  * @param {{ id: string, nextRun: Date, expression: null | string, lockedUntil?: Date | null, updateData?: {} | null }[]} completed
  * @param {Swag} swag
- * @returns {string}
+ * @returns {string[]}
  */
 function generateFlush (queue, completed, swag) {
-  const query = completed.map(({ id, nextRun, expression, lockedUntil, updateData }) => {
+  const statements = completed.map(({ id, nextRun, expression, lockedUntil, updateData }) => {
     if (nextRun === null) return format(swag.queries.deleteSingle, [swag.table, queue, id], swag.dialect)
     return format(swag.queries.flush, [swag.table, nextRun, id, queue, expression, lockedUntil ?? nextRun, updateData], swag.dialect)
-  }).join(';')
+  })
   completed.splice(0, completed.length)
-  return query
+  return statements
+}
+
+/**
+ * Runs several statements so they apply all together or not at all.
+ * @param {Swag} swag
+ * @param {string[]} statements
+ */
+async function runAtomic (swag, statements) {
+  if (!statements.length) return
+  if (swag.inTransaction) {
+    // The caller's transaction already makes these atomic, and a nested commit would end it early.
+    // MySQL connections usually reject multi-statement strings, so send them one at a time there.
+    if (swag.dialect === 'mysql') {
+      for (const statement of statements) await swag.none(statement)
+      return
+    }
+    return swag.none(statements.join(';'))
+  }
+  // Postgres runs a multi-statement string as a single implicit transaction, so a failure can't
+  // leave a pooled client stuck inside an open one.
+  if (swag.dialect === 'postgres') return swag.none(statements.join(';'))
+  return swag.none(`begin; ${statements.join(';')}; commit;`).catch(async err => {
+    // A failed statement skips the commit, so close the transaction rather than leave it open on the connection.
+    await swag.none('rollback').catch(() => {})
+    throw err
+  })
 }
 
 /**
@@ -138,7 +164,10 @@ export class Swag {
     table = 'jobs'
   } = {}) {
     this.initialized = false
+    /** @type {Promise<void> | null} */
+    this.initializing = null
     this.inTransaction = false
+    this.isView = false
 
     /** @type {Set<string>} */
     this.lockedJobs = new Set()
@@ -171,15 +200,21 @@ export class Swag {
   /**
    * Creates the jobs table and indexes if they do not exist. Runs automatically on first use,
    * but call it at boot if you plan to schedule through `withQuery`, which never initializes.
+   * Concurrent calls share one attempt, and a failed attempt is retried on the next call.
+   * @returns {Promise<void>}
    */
-  async init () {
-    if (this.initialized) return
-    this.initialized = true
-    await this.none(format(this.queries.init, [this.table, this.schema, '1'], this.dialect)).catch(err => {
-      if (err.message.includes('Duplicate')) return
-      if (err.message.includes('primary')) return
-      throw err
-    })
+  init () {
+    if (!this.initializing) {
+      this.initializing = this.none(format(this.queries.init, [this.table, this.schema, '1'], this.dialect)).catch(err => {
+        if (err.message.includes('Duplicate')) return
+        if (err.message.includes('primary')) return
+        throw err
+      }).then(() => { this.initialized = true }, err => {
+        this.initializing = null
+        throw err
+      })
+    }
+    return this.initializing
   }
 
   /**
@@ -235,12 +270,13 @@ export class Swag {
     * If a job by the same ID already exists in the queue, it will be replaced.
     */
   async schedule (queue, id, expression, data, preserveRunAt = false) {
-    await this.init()
+    // A view must reach its query function without awaiting first: better-sqlite3 transactions are synchronous.
+    if (!this.isView) await this.init()
     if (expression instanceof Date) expression = expression.toISOString()
 
     // While "nextTime" does support this object, converting it here is cleaner for the
     // database query.
-    if (typeof expression === 'object') expression = durationToISO8601(expression)
+    if (expression && typeof expression === 'object') expression = durationToISO8601(expression)
 
     const nextRun = nextTime(expression)
     if (!nextRun) return
@@ -298,30 +334,32 @@ export class Swag {
     * If a job by the same ID already exists in the queue, it will be replaced.
    */
   async scheduleMany (queue, jobs, preserveRunAt = false) {
-    await this.init()
+    if (!this.isView) await this.init()
 
-    const query = jobs.map(job => {
+    /** @type {string[]} */
+    const statements = []
+    for (const job of jobs) {
       let expression = job.expression
       if (expression instanceof Date) expression = expression.toISOString()
-      if (typeof expression === 'object') expression = durationToISO8601(expression)
+      if (expression && typeof expression === 'object') expression = durationToISO8601(expression)
 
       const nextRun = nextTime(expression)
-      if (!nextRun) return null
-      return format(this.queries.insert, [this.table, queue, job.id, nextRun, job.data ?? null, expression, !preserveRunAt], this.dialect)
-    }).join(';')
+      if (nextRun) statements.push(format(this.queries.insert, [this.table, queue, job.id, nextRun, job.data ?? null, expression, !preserveRunAt], this.dialect))
+    }
 
-    if (!query) return
-    // Inside a caller's transaction the statements are already atomic, and a nested commit would end it early.
-    await this.none(this.inTransaction ? query : `begin; ${query}; commit;`)
+    await runAtomic(this, statements)
   }
 
   /**
    * Returns a view of this scheduler that runs `schedule`, `scheduleMany` and `remove*` through
    * the given query function, typically one bound to an open transaction so jobs commit or roll
-   * back with the rest of your writes. The view never initializes the table (call `init()` at boot)
-   * and should not be used to run workers.
+   * back with the rest of your writes. The view never initializes the table (call `init()` at boot,
+   * or the first scheduler call inside your transaction may wait on its own locks) and can't run workers.
    *
    * @param {(str: string) => Promise<any>} query
+   * @param {{ none?: (str: string) => Promise<any>, inTransaction?: boolean }} [options]
+   * `none` runs statements that return no rows (on SQLite, pass one built on `db.exec`).
+   * Set `inTransaction: false` if `query` is not bound to a transaction, so `scheduleMany` wraps its own.
    * @returns {Swag}
    *
    * @example
@@ -332,33 +370,38 @@ export class Swag {
    * })
    * ```
    */
-  withQuery (query) {
+  withQuery (query, { none = query, inTransaction = true } = {}) {
     const view = Object.create(this)
     view.query = query
-    view.none = query
-    view.inTransaction = true
+    view.none = none
+    view.inTransaction = inTransaction
+    view.isView = true
     view.init = async () => {}
+    view.on = () => { throw new Error('Workers cannot run from a withQuery view; call on() on the scheduler itself.') }
+    view.stop = async () => { throw new Error('Workers cannot run from a withQuery view; call stop() on the scheduler itself.') }
     return view
   }
 
   /**
     * Removes a job / schedule from the scheduler.
     * @param {string} queue - The name of the queue to remove the job from.
-    * @param {string} [id] - The unique identifier for the job.
+    * @param {string | number} [id] - The unique identifier for the job.
     */
   async remove (queue, id) {
-    if (!id) return this.none(format(this.queries.deleteQueue, [this.table, queue], this.dialect))
-    return this.none(format(this.queries.deleteSingle, [this.table, queue, id], this.dialect))
+    if (id === undefined || id === null || id === '') return this.none(format(this.queries.deleteQueue, [this.table, queue], this.dialect))
+    // The id column is text, and Postgres won't compare text with a number.
+    return this.none(format(this.queries.deleteSingle, [this.table, queue, String(id)], this.dialect))
   }
 
   /**
     * Removes several jobs from a queue in one statement.
     * @param {string} queue - The name of the queue to remove the jobs from.
-    * @param {string[]} ids - The unique identifiers of the jobs.
+    * @param {Iterable<string | number>} ids - The unique identifiers of the jobs.
     */
   async removeMany (queue, ids) {
-    if (!ids.length) return
-    return this.none(format(this.queries.deleteMany, [this.table, queue, ids], this.dialect))
+    const idList = Array.from(ids, String)
+    if (!idList.length) return
+    return this.none(format(this.queries.deleteMany, [this.table, queue, idList], this.dialect))
   }
 
   /**
@@ -377,7 +420,6 @@ export class Swag {
    * @returns {{ onError: (handler: (err: any, job: import('./swag.d.ts').Job) => void | null | undefined | { expression: string | Date | import('./types.d.ts').SpecialDuration } | { lockedUntil: Date } | boolean | Promise<void | null | undefined | { expression: string | Date | import('./types.d.ts').SpecialDuration } | { lockedUntil: Date } | boolean>) => void}}
    */
   on (queue, handler, options) {
-    this.init()
     this.stop(queue)
     /** @type {any[]} */
     const completed = []
@@ -402,7 +444,8 @@ export class Swag {
     const run = () => {
       // Prevents more than one "processBatch" from running at the same time for the same queue.
       if (this.activeJobs.size > processOptions.concurrentJobs) return
-      processBatch(this.workerId, queue, handler, completed, processOptions)
+      // If the database isn't reachable yet, init fails quietly and is retried on the next poll.
+      this.init().then(() => processBatch(this.workerId, queue, handler, completed, processOptions)).catch(() => {})
     }
 
     setImmediate(run)
@@ -412,7 +455,7 @@ export class Swag {
     const flush = async (force) => {
       if (force) while (this.activeJobs.size) await new Promise(resolve => setTimeout(resolve, 100))
       if (!completed.length) return
-      return this.none(`begin; ${generateFlush(queue, completed, this)}; commit;`)
+      return runAtomic(this, generateFlush(queue, completed, this))
     }
 
     // On the flush interval, flush the completed jobs
@@ -439,10 +482,11 @@ export class Swag {
     if (!worker) return
     clearInterval(worker.batcherId)
     clearInterval(worker.flushId)
+    // Remove it before awaiting, so a worker registered by on() meanwhile isn't deleted.
+    delete this.workers[queue]
 
     // Force a flush before stopping
     await worker.flush(true)
-    delete this.workers[queue]
   }
 }
 
